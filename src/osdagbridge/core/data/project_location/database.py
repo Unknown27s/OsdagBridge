@@ -22,12 +22,44 @@ class Database:
         self.connection = sqlite3.connect(self.db_name)
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.cursor = self.connection.cursor()
-        if db_missing or not self._table_exists("stations"):
-            schema_file = os.path.join(os.path.dirname(__file__), 'schema.sql')
-            if os.path.exists(schema_file):
-                with open(schema_file, 'r', encoding='utf-8') as f:
-                    self.connection.executescript(f.read())
-                self.connection.commit()
+        if db_missing or self._seed_incomplete():
+            self._load_schema()
+
+    def _seed_incomplete(self) -> bool:
+        """Return True when the on-disk DB is a partial/legacy seed.
+
+        Older builds could leave a weather.sqlite containing only the
+        stations table. Location dropdowns are built from temperature_data,
+        so such a DB resolves no locations at all and must be reseeded.
+        """
+        for table in ("stations", "temperature_data", "zone_data", "windspeed_data"):
+            if not self._table_exists(table):
+                return True
+
+        # Empty tables mean the seed never completed (or the DB predates the
+        # weather tables). Either way, the location data cannot be trusted.
+        for table in ("stations", "temperature_data", "zone_data", "windspeed_data"):
+            self.cursor.execute(f"SELECT 1 FROM {table} LIMIT 1")
+            if self.cursor.fetchone() is None:
+                return True
+        return False
+
+    def _load_schema(self):
+        """(Re)create and seed the DB from the bundled schema.sql."""
+        schema_file = os.path.join(os.path.dirname(__file__), 'schema.sql')
+        if not os.path.exists(schema_file):
+            return
+        with open(schema_file, 'r', encoding='utf-8') as f:
+            schema_sql = f.read()
+        # schema.sql has no explicit transaction. Wrapping it keeps the
+        # ~1,100 seed INSERTs in one transaction instead of one fsync per
+        # statement, which can take minutes on btrfs.
+        try:
+            self.connection.executescript("BEGIN;\n" + schema_sql + "\nCOMMIT;")
+        except sqlite3.Error:
+            self.connection.rollback()
+            raise
+        self.connection.commit()
 
     def close(self):
         """Close the database connection."""
